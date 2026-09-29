@@ -1,18 +1,43 @@
-# Distributed ML Inference Platform: Case Study
+<div align="center">
 
-I designed and built a platform that runs ResNet-50 image classification over
-ImageNet across a five-node, CPU-only Kubernetes cluster. It covers everything
-from provisioning the VMs to a REST API that lets someone submit images and
-download predictions without touching Kubernetes or Spark. This write-up covers
-the design, the results, and what the measurements actually showed.
+# Distributed ML Inference Platform
 
-**Headline:** a 25-hour unattended run processed **7.2 million images** at a
-sustained **79.6 images/second**, with no failed passes and no slowdown over
-time.
+**Batch ResNet-50 inference over ImageNet on a five-node, CPU-only Kubernetes cluster, built end to end:
+from provisioning the VMs to a REST API that needs no Kubernetes or Spark knowledge to use.**
 
-> The source code is private. It is available to reviewers on request.
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-K3s_1.34-326CE5?style=flat-square&logo=kubernetes&logoColor=white)](#architecture)
+[![Apache Spark](https://img.shields.io/badge/Apache_Spark-3.5-E25A1C?style=flat-square&logo=apachespark&logoColor=white)](#architecture)
+[![PyTorch](https://img.shields.io/badge/PyTorch-ResNet--50-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](#architecture)
+[![Apache Airflow](https://img.shields.io/badge/Apache_Airflow-2.9-017CEE?style=flat-square&logo=apacheairflow&logoColor=white)](#architecture)
+[![MLflow](https://img.shields.io/badge/MLflow-tracking-0194E2?style=flat-square&logo=mlflow&logoColor=white)](#architecture)
+[![MinIO](https://img.shields.io/badge/MinIO-erasure_coded-C72E49?style=flat-square&logo=minio&logoColor=white)](#architecture)
+[![FastAPI](https://img.shields.io/badge/FastAPI-gateway-009688?style=flat-square&logo=fastapi&logoColor=white)](#architecture)
+<br>
+[![Prometheus](https://img.shields.io/badge/Prometheus-metrics-E6522C?style=flat-square&logo=prometheus&logoColor=white)](#architecture)
+[![Grafana](https://img.shields.io/badge/Grafana-dashboards-F46800?style=flat-square&logo=grafana&logoColor=white)](#architecture)
+[![Terraform](https://img.shields.io/badge/Terraform-IaC-844FBA?style=flat-square&logo=terraform&logoColor=white)](#architecture)
+[![Ansible](https://img.shields.io/badge/Ansible-config-EE0000?style=flat-square&logo=ansible&logoColor=white)](#architecture)
+[![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-CI-2088FF?style=flat-square&logo=githubactions&logoColor=white)](#architecture)
+
+| **7.2M** images processed | **25.1 h** unattended run | **79.6 img/s** sustained | **0** failed passes |
+|:-:|:-:|:-:|:-:|
+
+[Architecture](#architecture) · [Design decisions](#key-design-decisions) · [Results](#results) · [Findings](#what-the-measurements-actually-showed) · [Fault tolerance](#fault-tolerance) · [Lessons](#lessons)
+
+</div>
 
 ---
+
+> [!NOTE]
+> This repository is a write-up. The source code is private and is available to
+> reviewers on request.
+
+| | |
+|---|---|
+| **Role** | Sole designer and engineer: infrastructure, pipeline, API, observability, benchmarking |
+| **When** | April 2026 |
+| **Scale** | 5 VMs, 22 vCPU, 140 GB RAM, no GPUs; 900,000 ImageNet images in 900 shards |
+| **Stack** | Terraform, Ansible, K3s, Spark, PyTorch, Airflow, MLflow, MinIO, FastAPI, Prometheus, Grafana, Loki |
 
 ## What it does
 
@@ -46,7 +71,8 @@ flowchart LR
 **Cluster:** one small control node (2 vCPU, 20 GB) running orchestration and
 observability, and four workers (5 vCPU, 30 GB each) running inference and
 storage. The control node is deliberately lean: its services mostly wait on
-requests and scrape intervals, so the cores go to the workers.
+requests and scrape intervals, so the cores go to the workers. Services are
+split across five namespaces: compute, storage, MLOps, monitoring and gateway.
 
 | Layer | Technology |
 |---|---|
@@ -59,6 +85,38 @@ requests and scrape intervals, so the cores go to the workers.
 | Observability | Prometheus, Pushgateway, Grafana, Loki |
 | Security | Default-deny network policies per namespace, least-privilege RBAC, resource quotas |
 | CI | GitHub Actions: lint, tests, image builds to GHCR |
+
+<details>
+<summary><b>How a request flows through the system</b></summary>
+
+<br>
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant API as FastAPI gateway
+    participant AF as Airflow
+    participant OP as Spark Operator
+    participant S as Spark (driver + executors)
+    participant M as MinIO
+    participant T as MLflow
+
+    U->>API: POST /pipeline/submit
+    API->>AF: Trigger DAG run (server-generated run ID)
+    API-->>U: run ID
+    AF->>M: Check the input shards exist
+    AF->>OP: Create SparkApplication
+    OP->>S: Launch driver; driver requests 14 executors
+    S->>M: Read tar shards
+    S->>M: Write Parquet predictions
+    S->>T: Log parameters, metrics, artifacts
+    AF->>OP: Poll until complete, then clean up
+    U->>API: GET /pipeline/status/{run_id}
+    U->>API: GET /pipeline/results/{run_id}/download
+    API->>M: Stream Parquet back to the user
+```
+
+</details>
 
 ## Key design decisions
 
@@ -102,7 +160,7 @@ Each configuration processed the same 900,000 images once.
 | Larger input partitions | 14 | 80.95 | 5.78 |
 | + Speculative execution | 14 | 81.22 | 5.80 |
 | More memory per executor | 12 | 69.52 | 5.79 |
-| 25-hour run (8 passes) | 14 | 79.60 | 5.69 |
+| **25-hour run (8 passes)** | **14** | **79.60** | **5.69** |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/capacity-passes-dark.png">
@@ -116,8 +174,10 @@ gradual slowdown.
 
 ## What the measurements actually showed
 
-I originally expected storage I/O to be the bottleneck and tuned for it. When I
-went back over the data, the picture was different.
+> [!IMPORTANT]
+> I originally expected storage I/O to be the bottleneck and tuned for it. The
+> data says the system was bound by **the number of executors**, and about a
+> quarter of the worker cores ran no executor at all.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/per-executor-throughput-dark.png">
@@ -164,10 +224,11 @@ unaffected. The fix was a per-executor grouping key.
 | Worker node lost | Kubernetes evicts and reschedules its pods; the job restarts rather than failing |
 | Workflow task fails | Airflow retries it |
 
-The control node is a single point of failure: it hosts the workflow engine,
-tracking server, database and API. That was an accepted trade-off at this
-scale. In production I would separate the control plane and use managed
-metadata stores.
+> [!WARNING]
+> The control node is a single point of failure: it hosts the workflow engine,
+> tracking server, database and API. That was an accepted trade-off at this
+> scale. In production I would separate the control plane and use managed
+> metadata stores.
 
 ## Lessons
 
@@ -190,8 +251,13 @@ metadata stores.
 
 ## What I would do next
 
-- Run more, smaller executors (trimming the JVM heap, which inference barely
-  uses) and use the idle cores.
-- Repeat each configuration several times to separate real effects from noise.
-- Move the control-plane services off a single node.
-- Add a small local profile so the platform can be tried without a cluster.
+- [ ] Run more, smaller executors (trimming the JVM heap, which inference barely uses) and use the idle cores
+- [ ] Repeat each configuration several times to separate real effects from noise
+- [ ] Move the control-plane services off a single node
+- [ ] Add a small local profile so the platform can be tried without a cluster
+
+---
+
+<div align="center">
+<sub>Source code available to reviewers on request · <a href="https://github.com/Kasra-Sartaee">github.com/Kasra-Sartaee</a></sub>
+</div>
